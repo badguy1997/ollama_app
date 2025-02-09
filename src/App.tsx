@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import './App.css'
 
@@ -15,6 +15,19 @@ interface Chat {
   createdAt: number
 }
 
+interface SystemPrompt {
+  role: 'system'
+  content: string
+}
+
+const DEFAULT_SYSTEM_PROMPT: SystemPrompt = {
+  role: 'system',
+  content: `You are a helpful AI assistant powered by llama3.2. Follow these guidelines:
+- Use markdown formatting for better readability
+- Keep responses concise but informative
+- When code is involved, include examples`
+}
+
 function App() {
   const [chats, setChats] = useState<Chat[]>([])
   const [currentChatId, setCurrentChatId] = useState<string | null>(null)
@@ -23,6 +36,8 @@ function App() {
   const [isLoading, setIsLoading] = useState(false)
   const [model, setModel] = useState('llama3.2:latest')
   const [error, setError] = useState<string | null>(null)
+  const [isStreaming, setIsStreaming] = useState(false)
+  const abortControllerRef = useRef<AbortController | null>(null)
 
   // Load chats from localStorage on initial render
   useEffect(() => {
@@ -81,11 +96,81 @@ function App() {
     }))
   }
 
+  const createPrompt = (input: string) => {
+    let prompt = DEFAULT_SYSTEM_PROMPT.content + '\n\n'
+
+    // Add chat history for context
+    const recentMessages = messages.slice(-4) // Last 4 messages for context
+    if (recentMessages.length > 0) {
+      prompt += 'Previous Messages:\n'
+      recentMessages.forEach(msg => {
+        prompt += `${msg.role === 'user' ? 'Human' : 'Assistant'}: ${msg.content}\n`
+      })
+      prompt += '\n'
+    }
+
+    prompt += `Human: ${input}\n\nAssistant: `
+    return prompt
+  }
+
+  const handleStream = async (response: Response, newMessages: Message[]) => {
+    const reader = response.body?.getReader()
+    if (!reader) return
+
+    try {
+      let currentResponse = ''
+      const decoder = new TextDecoder()
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const chunk = decoder.decode(value)
+        const lines = chunk.split('\n').filter(Boolean)
+        
+        for (const line of lines) {
+          try {
+            const json = JSON.parse(line)
+            if (json.response) {
+              currentResponse += json.response
+              const assistantMessage: Message = {
+                role: 'assistant',
+                content: currentResponse,
+              }
+              setMessages([...newMessages, assistantMessage])
+              updateCurrentChat([...newMessages, assistantMessage])
+            }
+          } catch (e) {
+            console.error('Error parsing JSON:', e)
+          }
+        }
+      }
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        console.log('Stream aborted')
+      } else {
+        throw error
+      }
+    } finally {
+      reader.releaseLock()
+    }
+  }
+
+  const stopStreaming = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = null
+      setIsStreaming(false)
+    }
+  }
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!input.trim()) return
 
-    // Create new chat if none exists
+    // Stop any ongoing streaming
+    stopStreaming()
+
     if (!currentChatId) {
       createNewChat()
     }
@@ -97,8 +182,14 @@ function App() {
     setInput('')
     setIsLoading(true)
     setError(null)
+    setIsStreaming(true)
+
+    // Create new AbortController for this request
+    abortControllerRef.current = new AbortController()
 
     try {
+      const prompt = createPrompt(input)
+
       const response = await fetch('http://localhost:11434/api/generate', {
         method: 'POST',
         headers: {
@@ -106,9 +197,17 @@ function App() {
         },
         body: JSON.stringify({
           model: model,
-          prompt: input,
-          stream: false,
+          prompt,
+          stream: true,
+          options: {
+            temperature: 0.7,
+            top_k: 40,
+            top_p: 0.9,
+            repeat_penalty: 1.1,
+            stop: ['Human:', 'Assistant:']
+          }
         }),
+        signal: abortControllerRef.current.signal
       })
 
       if (!response.ok) {
@@ -116,24 +215,21 @@ function App() {
         throw new Error(`API Error: ${response.status} ${errorData}`)
       }
 
-      const data = await response.json()
-      if (!data.response) {
-        throw new Error('No response data received from Ollama')
-      }
-
-      const assistantMessage: Message = {
-        role: 'assistant',
-        content: data.response,
-      }
-      const updatedMessages = [...newMessages, assistantMessage]
-      setMessages(updatedMessages)
-      updateCurrentChat(updatedMessages)
+      await handleStream(response, newMessages)
     } catch (error) {
       console.error('Error details:', error)
       const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred'
       setError(errorMessage)
+      if (error.name !== 'AbortError') {
+        setMessages(prev => [
+          ...prev,
+          { role: 'assistant', content: `Error: ${errorMessage}` }
+        ])
+      }
     } finally {
       setIsLoading(false)
+      setIsStreaming(false)
+      abortControllerRef.current = null
     }
   }
 
@@ -293,21 +389,35 @@ function App() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 placeholder="Send a message..."
-                className="w-full bg-gray-700 text-white rounded-lg pl-4 pr-12 py-3 
+                className="w-full bg-gray-700 text-white rounded-lg pl-4 pr-24 py-3 
                          focus:outline-none focus:ring-2 focus:ring-blue-500"
                 disabled={isLoading}
               />
-              <button
-                type="submit"
-                disabled={isLoading || !input.trim()}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-gray-400 
-                         hover:text-white disabled:hover:text-gray-400 disabled:opacity-50"
-              >
-                <svg stroke="currentColor" fill="none" strokeWidth="2" viewBox="0 0 24 24" 
-                     className="w-4 h-4 rotate-90" xmlns="http://www.w3.org/2000/svg">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5"></path>
-                </svg>
-              </button>
+              <div className="absolute right-2 top-1/2 -translate-y-1/2 flex gap-2">
+                {isStreaming && (
+                  <button
+                    type="button"
+                    onClick={stopStreaming}
+                    className="p-2 text-red-400 hover:text-red-300"
+                    title="Stop generating"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                )}
+                <button
+                  type="submit"
+                  disabled={isLoading || !input.trim()}
+                  className="p-2 text-gray-400 hover:text-white 
+                           disabled:hover:text-gray-400 disabled:opacity-50"
+                >
+                  <svg stroke="currentColor" fill="none" strokeWidth="2" viewBox="0 0 24 24" 
+                       className="w-4 h-4 rotate-90" xmlns="http://www.w3.org/2000/svg">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5"></path>
+                  </svg>
+                </button>
+              </div>
             </form>
             {error && (
               <div className="mt-2 text-red-400 text-sm">
